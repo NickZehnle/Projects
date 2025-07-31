@@ -5,6 +5,6 @@
 ### Projects
 [Bayesian Fama-French Portfolio Analysis](https://NickZehnle.github.io/Projects/Bayes_Analysis/BayesFF.html)
 
-[Regime-Adaptive PCA Dtatistical Arbitrage Strategy](https://NickZehnle.github.io/Projects/PCA_Strategy/PCA.html)
+[Regime-Adaptive PCA Statistical Arbitrage Strategy](https://NickZehnle.github.io/Projects/PCA_Strategy/PCA.html)
 
 [Automated Implied Volatility Calculator](https://NickZehnle.github.io/Projects/AIVC/aivc.html)
