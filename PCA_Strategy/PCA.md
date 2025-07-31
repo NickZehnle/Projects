@@ -103,7 +103,7 @@ class PCAStatArbitrageAlgorithm(QCAlgorithm):
     def _knn_regime(self):
         spy_history = self.History(self.spy_symbol, 252, Resolution.Daily).close.unstack(level=0)
         if spy_history.empty:
-            return 0  # Default to reverting
+            return 0 
 
         returns = np.log(spy_history).diff().dropna()
 
