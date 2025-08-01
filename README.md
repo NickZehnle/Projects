@@ -1,7 +1,8 @@
 ## Hi! Welcome to my GitHub.
 
-#### I am currently pursuing a MS in Financial Mathematics at NCSU and recently received a BS in Mathematics & Economics from William & Mary.
- 
+#### MS in Financial Mathematics from North Carolina State University 
+#### BS in Mathematics & Economics from the College of William & Mary
+<br><br>
 ### Projects
 [Bayesian Fama-French Portfolio Analysis](https://NickZehnle.github.io/Projects/Bayes_Analysis/BayesFF.html)
 
