@@ -2,7 +2,7 @@
 
 #### MS in Financial Mathematics from North Carolina State University 
 #### BS in Mathematics & Economics from the College of William & Mary
-<br><br>
+<br>
 ### Projects
 [Bayesian Fama-French Portfolio Analysis](https://NickZehnle.github.io/Projects/Bayes_Analysis/BayesFF.html)
 
