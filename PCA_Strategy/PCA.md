@@ -1,214 +1,200 @@
 ## Regime-Adaptive PCA Statistical Arbitrage Strategy
 
 #### Backtest Results
-[Strategy Performance Report](PCA_Stat_Arb_Report.pdf)
+[Strategy Performance Report 2023-2025](PCA_Stat_Arb_Report_23-25.pdf)
+[Strategy Performance Report 2022-2024](PCA_Stat_Arb_Report_22-24.pdf)
+[Strategy Performance Statistics](PCA_Stat_Arb_Stats.pdf)
 
 #### Code
 ~~~python
 import pandas as pd
+import numpy as np
 from pykalman import KalmanFilter
 from AlgorithmImports import *
 from sklearn.decomposition import PCA
 import statsmodels.api as sm
 from arch import arch_model
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.arima.model import ARIMA
+from datetime import timedelta
+from QuantConnect.Data.Fundamental import MorningstarSectorCode
 
 class PCAStatArbitrageAlgorithm(QCAlgorithm):
-    
+
     def Initialize(self):
-        self.SetStartDate(2022, 1, 1)
-        self.SetEndDate(2024, 4, 1)
+        # Backtest 
+        self.SetStartDate(2023, 1, 1)
+        self.SetEndDate(2025, 1, 1)
         self.SetCash(1_000_000)
         self.Settings.MinimumOrderMarginPortfolioPercentage = 0
 
-        self._num_components = self.get_parameter("num_components", 2)
-        self._lookback = self.get_parameter("lookback_days", 504)
-        self._z_score_threshold = self.get_parameter("z_score_threshold", 1)
-        self._universe_size = self.get_parameter("universe_size", 30)
-        self.mu = self.get_parameter("mu", 200)
-        self.theta = self.get_parameter("theta", .03)
-        self._pca_lookback = self.get_parameter("pca_lookback", 10)
-
+        # Parameters
+        self._pca_lookback = 20
+        self._regime_lookback = 20
+        self._universe_size = 60
+        
+        # Setup
         self.indicators = {}
-        self.indicator_period = 14
         self.SetWarmUp(timedelta(days=44))
-
-        schedule_symbol = Symbol.Create("SPY", SecurityType.EQUITY, Market.USA)
-        date_rule = self.DateRules.WeekStart(schedule_symbol)
-        self.UniverseSettings.Schedule.On(date_rule)
-        self.UniverseSettings.DataNormalizationMode = DataNormalizationMode.RAW
-        self._universe = self.AddUniverse(self._select_assets)
-
+        self.industry = MorningstarSectorCode.TECHNOLOGY
+        self.AddUniverse(self.CoarseSelection, self.FineSelection)
+        self.benchmark_etf = self.AddEquity("QQQ", Resolution.Daily).Symbol
         self.spy_symbol = self.AddEquity("SPY", Resolution.Daily).Symbol
 
+        # Trading schedule
         self.Schedule.On(
-            date_rule, 
-            self.TimeRules.AfterMarketOpen(schedule_symbol, 1), 
+            self.DateRules.WeekStart(self.spy_symbol),
+            self.TimeRules.AfterMarketOpen(self.spy_symbol, 5),
             self._trade
         )
 
-        chart = Chart('Explained Variance Ratio')
-        self.AddChart(chart)
-        for i in range(self._num_components):
-            chart.AddSeries(Series(f"Component {i}", SeriesType.LINE, ""))
+        self.Schedule.On(
+            self.DateRules.WeekEnd(self.spy_symbol),
+            self.TimeRules.BeforeMarketClose(self.spy_symbol, 5),
+            lambda: self.Liquidate()
+        )
+
+        # Additional Charts
+        evr_chart = Chart('Explained Variance Ratio')
+        self.AddChart(evr_chart)
+        for i in range(2):
+            evr_chart.AddSeries(Series(f"Component {i}", SeriesType.LINE, ""))
+
+        z_chart = Chart('Volatility Adjusted Threshold')
+        z_chart.AddSeries(Series('Z-Score Threshold', SeriesType.LINE, ''))
+        self.AddChart(z_chart)
+
+    def CoarseSelection(self, coarse):
+        # Universe by dollar volume
+        filtered = [c for c in coarse if c.HasFundamentalData and c.Price > 5]
+        top = sorted(filtered, key=lambda x: x.DollarVolume, reverse=True)[:500]
+        return [x.Symbol for x in top]
+
+    def FineSelection(self, fine):
+        # Refine universe to satisfy intended size and industry
+        same_industry = [
+            f for f in fine
+            if f.HasFundamentalData
+            and f.AssetClassification is not None
+            and getattr(f.AssetClassification, "MorningstarSectorCode", None) == self.industry
+        ]
+
+        selected = sorted(
+            same_industry,
+            key=lambda f: getattr(f, "MarketCap", 0) or 0,
+            reverse=True
+        )[:self._universe_size]
+
+        self.selected = [x.Symbol for x in selected]
+        return self.selected
 
     def OnSecuritiesChanged(self, changes):
+        # Compute RSI for additional robustness of signal
         for added in changes.AddedSecurities:
             symbol = added.Symbol
             if symbol not in self.indicators:
-                rsi = self.RSI(symbol, self.indicator_period, MovingAverageType.Wilders, Resolution.Daily)
-                macd = self.MACD(symbol, 12, 26, 9, MovingAverageType.Exponential, Resolution.Daily)
-                self.indicators[symbol] = {"RSI": rsi, "MACD": macd}
+                rsi = self.RSI(symbol, 14, MovingAverageType.Wilders, Resolution.Daily)
+                self.indicators[symbol] = {"RSI": rsi}
 
-    def _select_assets(self, fundamental):
-        return [
-            f.Symbol 
-            for f in sorted(
-                [f for f in fundamental if f.Price > 5], 
-                key=lambda f: f.DollarVolume
-            )[-self._universe_size:]
-        ]
-    
     def _trade(self):
+        # Trading logic
+        if self.IsWarmingUp or not hasattr(self, "selected") or not self.selected:
+            return
+
         tradeable_assets = [
-            symbol 
-            for symbol in self._universe.Selected 
-            if self.Securities[symbol].Price and symbol in self.CurrentSlice.QuoteBars
+            s for s in self.selected
+            if s in self.Securities and self.Securities[s].HasData
         ]
 
         history = self.History(
-            tradeable_assets, self._lookback, Resolution.Daily, 
+            tradeable_assets, self._pca_lookback + 10, Resolution.Daily,
             dataNormalizationMode=DataNormalizationMode.ScaledRaw
         ).close.unstack(level=0)
-        history = history.loc[:, history.count() >= 500]
-        self.Debug(f'Number of assets: {len(history.columns)}')
-
-        if history.empty:
+        
+        history = history.loc[:, history.count() >= self._pca_lookback]
+        if history.empty or history.shape[1] < 5:
             return
 
-        avg_vol = self._egarch_vol(history)
-        self._z_score_threshold = self._adjust_z_score_threshold(avg_vol)
-        regime = self._knn_regime()
-        weights = self._get_weights(history, regime)
+        etf_history = self.History(self.benchmark_etf, 504, Resolution.Daily).close
+        if etf_history.empty:
+            return
 
-        self.SetHoldings(
-            [
-                PortfolioTarget(symbol, -weight) 
-                for symbol, weight in weights.items()
-            ], 
-            True
-        )
+        etf_returns = np.log(etf_history).diff().dropna()
+        etf_vol = self._egarch_vol(etf_returns)
+        z_score_threshold = self._adjust_z_score_threshold(etf_vol)
+        self.Plot('Volatility Adjusted Threshold', 'Z-Score Threshold', z_score_threshold)
 
-    def _knn_regime(self):
-        spy_history = self.History(self.spy_symbol, 252, Resolution.Daily).close.unstack(level=0)
-        if spy_history.empty:
-            return 0 
+        regime, direction = self._arima_regime(etf_returns)
 
-        returns = np.log(spy_history).diff().dropna()
+        if regime == "trending":
+            self.SetHoldings(self.benchmark_etf, direction)
+            return
 
-        features = pd.DataFrame(index=returns.index)
-        features['volatility'] = returns.rolling(20).std().mean(axis=1)
-        features['autocorr'] = returns.rolling(20).apply(lambda x: x.autocorr(), raw=False).mean(axis=1)
-        features['trend'] = returns.mean(axis=1).rolling(20).mean()
+        weights = self._get_weights(history, regime, z_score_threshold)
+        self.SetHoldings([PortfolioTarget(sym, -w) for sym, w in weights.items()], True)
 
-        features = features.dropna()
+    def _arima_regime(self, returns):
+        # Detect industry regime using ARIMA 
+        fit = ARIMA(returns[-self._regime_lookback:], order=(4, 0, 4)).fit()
+        trend_strength = np.mean(fit.arparams) + np.mean(fit.maparams)
+        bias = np.std(fit.resid)
+        if trend_strength > bias:
+            regime = "trending"
+            direction = np.sign(fit.fittedvalues.iloc[-1] + fit.resid.iloc[-1])
+        else:
+            regime = "reverting"
+            direction = 0
+        self.Debug(f"ARIMA Regime detected: {regime}, direction: {direction}")
+        return regime, direction
 
-        features['label'] = ((features['autocorr'] > 0) & (features['trend'].abs() > 0.001)).astype(int)
+    def _egarch_vol(self, returns):
+        # Determine conditional volatility of industry ETF using EGARCH
+        model = arch_model(returns, vol="EGARCH", p=1, q=1)
+        fit = model.fit(disp="off")
+        return fit.conditional_volatility.iloc[-1]
 
-        scaler = StandardScaler()
-        X = scaler.fit_transform(features[['volatility', 'autocorr', 'trend']])
-        y = features['label']
-        knn = KNeighborsClassifier(n_neighbors=3)
-        knn.fit(X, y)
+    def _adjust_z_score_threshold(self, vol):
+        # Adjust threshold for signal according to current conditional volatility
+        if not hasattr(self, "_vol_history"):
+            self._vol_history = []
 
-        current_features = pd.DataFrame({
-            'volatility': [returns[-20:].std().mean()],
-            'autocorr': [returns[-20:].apply(lambda x: x.autocorr()).mean()],
-            'trend': [returns[-20:].mean().mean()]
-        })
+        self._vol_history.append(vol)
+        self._vol_history = self._vol_history[-20:]
+        vol_percentile = np.mean(np.array(self._vol_history) < vol)
+        return .5 + vol_percentile
 
-        X_current = scaler.transform(current_features)
-        regime = knn.predict(X_current)[0]  
-
-        self.Debug(f"Regime detected: {'Trending' if regime == 1 else 'Reverting'}")
-        return regime
-    
-    def _egarch_vol(self, history):
-        history = history.dropna()
-        returns = (np.log(history)).diff().dropna()
-        vol_ests = {}
-
-        for asset in returns.columns:
-            model = arch_model(returns[asset], vol='EGARCH', p=1, q=1)
-            fit = model.fit(disp="off")
-            vol_ests[asset] = fit.conditional_volatility[-1] 
-
-        avg_vol = pd.Series(vol_ests).mean()
-        self.Debug(f'avg_vol: {avg_vol}')
-        return avg_vol
-
-    def _adjust_z_score_threshold(self, avg_vol):
-        sigmoid = 1 / (1 + np.exp(-self.mu * (avg_vol - self.theta)))
-        z_score_threshold = 0.5 + (sigmoid * (1.5 - 0.5)) 
-        self.Debug(f'z_score_threshold: {z_score_threshold}')
-        return z_score_threshold
-
-    def _get_weights(self, history, regime):
+    def _get_weights(self, history, regime, z_score_threshold):
+        # Perform PCA on log prices, compute Z-scores on Kalman filtered residuals
+        # Weight positions according to composite PCA-RSI Z-scores above the threshold 
         sample = np.log(history[-self._pca_lookback:].dropna(axis=1))
         sample -= sample.mean()
+
         model = PCA().fit(sample)
+        cum_var = np.cumsum(model.explained_variance_ratio_)
+        num_components = np.searchsorted(cum_var, 0.8) + 1
 
-        for i in range(self._num_components):
-            self.Plot(
-                'Explained Variance Ratio', f"Component {i}", 
-                model.explained_variance_ratio_[i]
-            )
+        for i in range(min(num_components, len(model.explained_variance_ratio_))):
+            self.Plot('Explained Variance Ratio', f"Component {i}", model.explained_variance_ratio_[i])
 
-        factors = np.dot(sample, model.components_.T)[:, :self._num_components]
+        factors = np.dot(sample, model.components_.T)[:, :num_components]
         factors = sm.add_constant(factors)
-
-        model_by_ticker = {
-            ticker: sm.OLS(sample[ticker], factors).fit() 
-            for ticker in sample.columns
-        }
-
-        resids = pd.DataFrame(
-            {ticker: self._apply_kalman_filter(model.resid) for ticker, model in model_by_ticker.items()}
-        )
-
+        model_by_ticker = {t: sm.OLS(sample[t], factors).fit() for t in sample.columns}
+        resids = pd.DataFrame({t: self._apply_kalman_filter(m.resid) for t, m in model_by_ticker.items()})
         zscores = ((resids - resids.mean()) / resids.std()).iloc[-1]
 
-        rsi_vals = {}
-        macd_vals = {}
+        rsi_vals = {
+            s: ind["RSI"].Current.Value
+            for s, ind in self.indicators.items()
+            if s in zscores.index and all(i.IsReady for i in ind.values())
+        }
 
-        for symbol in zscores.index:
-            indicators = self.indicators.get(symbol)
-            if indicators is None or not all(indicator.IsReady for indicator in indicators.values()):
-                continue
+        rsi_vals = pd.Series(rsi_vals)
+        rsi_z = (rsi_vals - rsi_vals.mean()) / rsi_vals.std()
 
-            rsi_vals[symbol] = indicators["RSI"].Current.Value
-            macd_vals[symbol] = indicators["MACD"].Current.Value - indicators["MACD"].Signal.Current.Value
+        trend_factor = 1 if regime == "trending" else 0
+        adj = {s: (1 - trend_factor) * (0.8 * zscores[s] + 0.2 * rsi_z.get(s,0)) for s in zscores.index}
+        adj = pd.Series(adj).dropna()
 
-        def compute_z_scores(val_dict):
-            series = pd.Series(val_dict)
-            return (series - series.mean()) / series.std()
-
-        rsi_z = compute_z_scores(rsi_vals)
-        macd_z = compute_z_scores(macd_vals)
-
-        adj_scores = {}
-        for symbol in zscores.index:
-            if symbol not in rsi_z or symbol not in macd_z:
-                continue
-
-            if regime == 0:
-                adj_scores[symbol] = 0.7 * zscores[symbol] - 0.3 * rsi_z[symbol]
-            else:
-                adj_scores[symbol] = -0.3 * zscores[symbol] + 0.7 * macd_z[symbol]
-
-        adj_scores = pd.Series(adj_scores)
-        selected = adj_scores[abs(adj_scores) > self._z_score_threshold]
+        selected = adj[abs(adj) > z_score_threshold]
 
         if not selected.empty:
             weights = selected * (1 / selected.abs().sum())
@@ -217,6 +203,7 @@ class PCAStatArbitrageAlgorithm(QCAlgorithm):
         return pd.Series(dtype=float)
 
     def _apply_kalman_filter(self, series):
+        # Specify Kalman filter to reduce noise in residuals
         kf = KalmanFilter(
             transition_matrices=[1],
             observation_matrices=[1],
@@ -225,8 +212,6 @@ class PCAStatArbitrageAlgorithm(QCAlgorithm):
             observation_covariance=1,
             transition_covariance=0.01
         )
-        
         state_means, _ = kf.filter(series.values)
         return pd.Series(state_means.flatten(), index=series.index)
-
 ~~~
