@@ -2,7 +2,9 @@
 
 #### Backtest Results
 [Strategy Performance Report 2023-2025](PCA_Stat_Arb_Report_23-25.pdf)
+
 [Strategy Performance Report 2022-2024](PCA_Stat_Arb_Report_22-24.pdf)
+
 [Strategy Performance Statistics](PCA_Stat_Arb_Stats.pdf)
 
 #### Code
